@@ -2164,6 +2164,39 @@ function _dispatchExtensionTurnLifecycle(type,sessionId,streamId,details={}){
   }
 }
 
+// #STREAM_DONE coalescer: decide, BEFORE the settle render, whether arming the
+// one-shot "keep just-settled worklog open" token can have ANY rendering effect.
+// The armed token is consumed in exactly two render paths (ui.js):
+//   * transparent-stream mode  -> `justSettled` lifts the #5966 per-turn row cap
+//   * compact-worklog mode     -> `keepSettledWorklogOpen` force-opens the settled
+//                                 worklog group so the live->settled swap is
+//                                 height-stable, then the in-place collapse pass
+//                                 (_collapseJustSettledWorklogInPlace) returns it
+//                                 to the copied disclosure state.
+// If NEITHER path can produce a force-opened group for a settled assistant scene,
+// the armed flag is a render no-op: the armed settle render and the follow-up
+// unarmed render would build byte-identical DOM. The STREAM_DONE handler then does
+// a SINGLE unarmed render with the live scroll snapshot instead of the
+// arm-render / collapse-fail / re-render pair — halving the full #msgInner rebuild
+// (the "画面抽搐" jank) on large sessions, with identical final DOM + cache.
+//
+// Conservative by construction: any doubt (transparent mode, or ANY settled
+// assistant scene that carries worklog-worthy rows) returns true so the existing
+// arm + in-place-collapse flow is preserved untouched.
+function _settleArmKeepOpenCouldAffectRender(){
+  // Transparent stream: arming changes the row cap on the just-settled turn.
+  if(typeof isTransparentStream==='function'&&isTransparentStream()) return true;
+  // Non-compact activity modes never promote a scene to a worklog group.
+  if(typeof isCompactWorklogMode==='function'&&!isCompactWorklogMode()) return false;
+  if(typeof _anchorSceneSceneHasWorklogWorthyRows!=='function') return true;
+  const msgs=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages:[];
+  for(const m of msgs){
+    if(!m||m.role!=='assistant'||!m._anchor_activity_scene) continue;
+    if(_anchorSceneSceneHasWorklogWorthyRows(m._anchor_activity_scene)) return true;
+  }
+  return false;
+}
+
 function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!activeSid||!streamId) return;
   const reconnecting=!!options.reconnecting;
@@ -6514,17 +6547,35 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _doneLiveScrollSnapshot=typeof _captureMessageScrollSnapshot==='function'
             ? _captureMessageScrollSnapshot()
             : null;
-          if(typeof _armKeepSettledWorklogOpen==='function') _armKeepSettledWorklogOpen(_settledStreamId);
-          syncTopbar();renderMessages({preserveScroll:true});
-          if(typeof _disarmKeepSettledWorklogOpen==='function') _disarmKeepSettledWorklogOpen();
-          const _collapsedInPlace=typeof _collapseJustSettledWorklogInPlace==='function'
-            && _collapseJustSettledWorklogInPlace(_settledStreamId);
-          if(!_collapsedInPlace&&typeof _renderMessagesWithScrollSnapshot==='function'){
-            _renderMessagesWithScrollSnapshot({_prescrollSnapshot:_doneLiveScrollSnapshot});
-          }else if(!_collapsedInPlace){
-            renderMessages({preserveScroll:true});
-          }else if(_doneLiveScrollSnapshot&&typeof _restoreMessageScrollSnapshotSameFrame==='function'){
-            _restoreMessageScrollSnapshotSameFrame(_doneLiveScrollSnapshot);
+          // #STREAM_DONE coalescer (画面抽搐 fix): when the one-shot keep-open token
+          // cannot affect this render at all (see _settleArmKeepOpenCouldAffectRender),
+          // the armed settle render and its follow-up unarmed render would build the
+          // same DOM — collapse the pair into ONE unarmed render that also populates
+          // the cache, restoring the live scroll snapshot same-frame. Otherwise keep
+          // the original arm -> render -> disarm -> in-place-collapse sequence exactly.
+          if(!_settleArmKeepOpenCouldAffectRender()){
+            syncTopbar();
+            if(typeof _renderMessagesWithScrollSnapshot==='function'){
+              _renderMessagesWithScrollSnapshot({_prescrollSnapshot:_doneLiveScrollSnapshot});
+            }else{
+              renderMessages({preserveScroll:true});
+              if(_doneLiveScrollSnapshot&&typeof _restoreMessageScrollSnapshotSameFrame==='function'){
+                _restoreMessageScrollSnapshotSameFrame(_doneLiveScrollSnapshot);
+              }
+            }
+          }else{
+            if(typeof _armKeepSettledWorklogOpen==='function') _armKeepSettledWorklogOpen(_settledStreamId);
+            syncTopbar();renderMessages({preserveScroll:true});
+            if(typeof _disarmKeepSettledWorklogOpen==='function') _disarmKeepSettledWorklogOpen();
+            const _collapsedInPlace=typeof _collapseJustSettledWorklogInPlace==='function'
+              && _collapseJustSettledWorklogInPlace(_settledStreamId);
+            if(!_collapsedInPlace&&typeof _renderMessagesWithScrollSnapshot==='function'){
+              _renderMessagesWithScrollSnapshot({_prescrollSnapshot:_doneLiveScrollSnapshot});
+            }else if(!_collapsedInPlace){
+              renderMessages({preserveScroll:true});
+            }else if(_doneLiveScrollSnapshot&&typeof _restoreMessageScrollSnapshotSameFrame==='function'){
+              _restoreMessageScrollSnapshotSameFrame(_doneLiveScrollSnapshot);
+            }
           }
           if(typeof _restoreMessageRenderWindowAfterSettledRender==='function') _restoreMessageRenderWindowAfterSettledRender();
           if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
