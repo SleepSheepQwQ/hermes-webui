@@ -11058,6 +11058,9 @@ from api.models import (
     load_projects,
     save_projects,
     import_cli_session,
+    read_composer_draft,
+    save_composer_draft,
+    delete_composer_draft,
     CLAUDE_CODE_SOURCE,
     get_cli_sessions,
     get_cli_session_messages,
@@ -16727,11 +16730,18 @@ def handle_post(handler, parsed) -> bool:
             sid = query.get("session_id", [""])[0] if parsed.query else ""
             if not sid:
                 return bad(handler, "session_id is required", 400)
-            try:
-                s = get_session(sid)
-            except KeyError:
-                return bad(handler, "Session not found", 404)
-            draft = getattr(s, "composer_draft", {}) or {}
+            # Draft sidecar first (authoritative, small, lock-free). Fall back to
+            # the in-memory / on-disk session field only when no sidecar exists
+            # (legacy pre-split draft, or a rollback writer that only touched the
+            # main JSON). get_session() is only consulted on that fallback path,
+            # so the common case never pays a full session resolve.
+            draft = read_composer_draft(sid)
+            if not draft:
+                try:
+                    s = get_session(sid)
+                except KeyError:
+                    return bad(handler, "Session not found", 404)
+                draft = getattr(s, "composer_draft", {}) or {}
             return j(handler, {"draft": draft})
         # POST
         try:
@@ -16762,32 +16772,64 @@ def handle_post(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
         _draft_mark("after_get_session")
-        unchanged = False
-        with _get_session_agent_lock(sid):
-            _draft_mark("acquired_lock")
-            current_draft = dict(getattr(s, "composer_draft", {}) or {})
-            next_draft = dict(current_draft)
-            if text is not None:
-                next_draft["text"] = text
-            if files is not None:
-                next_draft["files"] = files
-            if next_draft == current_draft:
-                unchanged = True
-                saved_draft = current_draft
-            else:
-                s.composer_draft = next_draft
-                # Draft persistence is not conversation activity. Touching updated_at
-                # here makes the active-session external-refresh poll force-reload the
-                # current chat every few seconds while the user is typing, and that
-                # delayed reload can restore an older draft over newer local input.
-                _draft_mark("before_save")
-                s.save(touch_updated_at=False, skip_index=True)
-                _draft_mark("after_save")
-                saved_draft = s.composer_draft
-        _draft_mark("released_lock")
+        # Snapshot the CURRENT draft for the comparison + change detection. The
+        # small draft sidecar is authoritative; the in-memory Session field is a
+        # mirror (kept fresh by the merge in Session.load / the assignment
+        # below). In-memory is checked first so back-to-back rapid keystrokes —
+        # where the 400 ms debounce just fired and the sidecar write may not be
+        # visible to a different thread's cache yet — see the newest value.
+        current_draft = dict(getattr(s, "composer_draft", {}) or {})
+        if not current_draft:
+            current_draft = read_composer_draft(sid)
+        next_draft = dict(current_draft)
+        if text is not None:
+            next_draft["text"] = text
+        if files is not None:
+            next_draft["files"] = files
+        # ── Fast-fail #1: unchanged payload, BEFORE the lock ────────────────
+        # The frontend debounces, but a paused-then-resumed composer can re-send
+        # an identical payload. Returning here without touching the per-session
+        # lock stops a no-op request from queueing behind whatever long-running
+        # operation holds it (this is the exact 47–76 s stall the audit found).
+        #
+        # TOCTOU trade-off (accepted): we compare WITHOUT the lock, so a
+        # concurrent writer could change the draft between this check and the
+        # response; we would report ``unchanged`` for a payload that is no longer
+        # current. The consequence is bounded and self-healing — the stale value
+        # is only the composer draft, the very next keystroke re-sends, and a
+        # truly concurrent same-session edit means the user has two clients
+        # typing at once where last-writer-wins is the expected semantic anyway.
+        if next_draft == current_draft:
+            payload = {"ok": True, "unchanged": True, "draft": current_draft}
+            try:
+                _draft_mark("before_json")
+                j(handler, payload)
+                _draft_mark("after_json")
+            finally:
+                _draft_stages.append(("end", _draft_time.monotonic()))
+                if _draft_stages[-1][1] - _draft_t0 > 0.2:
+                    parts = " ".join(
+                        f"{n}={((t - prev[1]) * 1000):.1f}ms"
+                        for (n, t), prev in zip(_draft_stages[1:], _draft_stages[:-1], strict=True)
+                    )
+                    handler._safe_webui_print(
+                        "[SLOW] /api/session/draft total=%.1fms stages: %s"
+                        % ((_draft_stages[-1][1] - _draft_t0) * 1000, parts)
+                    )
+            return True
+        # ── Persist the draft to its OWN small sidecar ──────────────────────
+        # No Session.save() → the whole multi-MB transcript is never
+        # re-serialized for a keystroke, and no per-session agent lock is taken,
+        # so a draft write can no longer block (or be blocked by) the
+        # conversation. The write is a tmp-file + os.replace atomic swap of a
+        # few-KB file. The in-memory mirror is updated so other routes that read
+        # ``s.composer_draft`` on the resident object still see it.
+        s.composer_draft = next_draft
+        _draft_mark("before_save")
+        save_composer_draft(sid, next_draft)
+        _draft_mark("after_save")
+        saved_draft = next_draft
         payload = {"ok": True, "draft": saved_draft}
-        if unchanged:
-            payload["unchanged"] = True
         _draft_mark("before_json")
         j(handler, payload)
         _draft_mark("after_json")
@@ -16966,6 +17008,13 @@ def handle_post(handler, parsed) -> bool:
             delete_run_journal(sid)
         except Exception:
             logger.debug("Failed to delete run journal for deleted session %s", sid)
+        # Remove the standalone composer-draft sidecar so a deleted conversation
+        # does not leave its unsent draft (which may contain private text) on
+        # disk. Best-effort — the helper swallows its own errors.
+        try:
+            delete_composer_draft(sid)
+        except Exception:
+            logger.debug("Failed to delete composer-draft sidecar for session %s", sid)
         # The weak lock registry releases this entry automatically after all
         # holders and waiters drop their strong references.
         # Prune the completion-dedup entry too. The reaper sweeps it once the

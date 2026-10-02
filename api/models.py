@@ -1448,6 +1448,96 @@ def _validated_webui_pending_user_timestamp_identity(session, value):
     return (stream_id, pending_timestamp)
 
 
+# ── Standalone composer-draft sidecar ────────────────────────────────────────
+#
+# WHY: every keystroke (400 ms debounced) used to POST /api/session/draft, which
+# invoked Session.save(). save() unconditionally re-serializes the WHOLE session
+# (messages + context_messages + tool_calls + anchor_activity_scenes — measured
+# at 5.85–7.28 MB for large conversations) and rewrites the sidecar atomically
+# while holding the per-session agent lock. On a large session that meant tens
+# of seconds inside the lock, so every other request for the same session queued
+# behind a keystroke autosave.
+#
+# The draft is a few KB of text and has nothing to do with the transcript, so it
+# now lives in its own tiny sidecar ``sessions/<sid>.draft.json`` written with a
+# tmp-file + os.replace atomic swap. The main session JSON keeps whatever
+# composer_draft it carried at its last full save, so nothing that reads
+# ``Session.composer_draft`` off a loaded object breaks; the small file is the
+# authoritative store and is merged onto the object at load time.
+
+def _composer_draft_sidecar_path(session_id: str):
+    """Path of ``<sid>.draft.json`` for a validated session id, else ``None``."""
+    if not is_safe_session_id(session_id):
+        return None
+    return SESSION_DIR / f'{session_id}.draft.json'
+
+
+def read_composer_draft(session_id: str):
+    """Read the standalone composer-draft sidecar. Returns a dict (``{}`` on miss).
+
+    Missing / unreadable / malformed files fail soft to ``{}`` — a lost draft is
+    recoverable (the next keystroke re-sends it), a raised exception in a load
+    path is not.
+    """
+    p = _composer_draft_sidecar_path(session_id)
+    if p is None or not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError, ValueError):
+        logger.debug("Failed to read composer-draft sidecar %s", p, exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    draft = data.get('draft')
+    return draft if isinstance(draft, dict) else {}
+
+
+def save_composer_draft(session_id: str, draft) -> bool:
+    """Atomically write the standalone composer-draft sidecar.
+
+    tmp file + os.replace (mirrors Session.save()), 0o600 to match the session
+    files. Returns True on success; raises OSError on write failure so the
+    caller can surface an error.
+    """
+    p = _composer_draft_sidecar_path(session_id)
+    if p is None:
+        raise ValueError(f"Unsafe session_id {session_id!r}; refusing to write draft sidecar")
+    payload = json.dumps(
+        {'session_id': session_id, 'draft': draft if isinstance(draft, dict) else {}},
+        ensure_ascii=False,
+        indent=2,
+    )
+    tmp = p.with_suffix(f'.draft.json.tmp.{os.getpid()}.{threading.current_thread().ident}')
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        _safe_replace(tmp, p)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    return True
+
+
+def delete_composer_draft(session_id: str) -> bool:
+    """Remove the standalone composer-draft sidecar. Best-effort, returns True if gone."""
+    p = _composer_draft_sidecar_path(session_id)
+    if p is None:
+        return False
+    try:
+        p.unlink(missing_ok=True)
+        return True
+    except OSError:
+        logger.debug("Failed to unlink composer-draft sidecar %s", p, exc_info=True)
+        return False
+
+
 class Session:
     def __init__(self, session_id: str=None, title: str='Untitled',
                  workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
@@ -1639,6 +1729,15 @@ class Session:
     @property
     def path(self):
         return SESSION_DIR / f'{self.session_id}.json'
+
+    @property
+    def draft_path(self):
+        """Path of the standalone composer-draft sidecar (``<sid>.draft.json``).
+
+        The composer draft lives in its OWN small file rather than in the
+        (potentially multi-MB) session JSON. See ``save_composer_draft`` for why.
+        """
+        return SESSION_DIR / f'{self.session_id}.draft.json'
 
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
         if not is_safe_session_id(self.session_id):
@@ -1962,6 +2061,19 @@ class Session:
         data = json.loads(p.read_text(encoding='utf-8'))
         data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
         session = cls(**data)
+        # Composer-draft sidecar reconciliation. The small ``<sid>.draft.json``
+        # is authoritative when it exists; otherwise fall back to whatever
+        # ``composer_draft`` the main session JSON still carries (legacy value
+        # from before the split, or written by an older WebUI version on
+        # rollback). This keeps an unsent draft alive across the upgrade AND a
+        # downgrade. Only applied to full loads — a fresh ``cls(**data)`` has an
+        # empty dict, never a stale one.
+        try:
+            _draft_sidecar = read_composer_draft(sid)
+            if _draft_sidecar:
+                session.composer_draft = _draft_sidecar
+        except Exception:
+            logger.debug("composer-draft sidecar read failed for %s", sid, exc_info=True)
         if _collapsed_partials:
             try:
                 # Self-heal bloated sessions on first full load without touching
@@ -2032,6 +2144,15 @@ class Session:
             parsed['messages'] = []
             parsed['tool_calls'] = []
             session = cls(**parsed)
+            # Composer-draft sidecar reconciliation (mirrors load()). The
+            # metadata prefix may carry a stale legacy composer_draft from the
+            # last full save; the small sidecar wins when present.
+            try:
+                _draft_sidecar = read_composer_draft(sid)
+                if _draft_sidecar:
+                    session.composer_draft = _draft_sidecar
+            except Exception:
+                logger.debug("composer-draft sidecar read failed for %s", sid, exc_info=True)
             sidecar_message_count = _parse_nonnegative_int(parsed.get('message_count'))
             index_message_count = None
             if sidecar_message_count is None:
