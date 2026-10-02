@@ -66,6 +66,84 @@ _SNAPSHOT_ARGS_MAX_STRING_CHARS = 8192
 _SNAPSHOT_ARGS_MAX_TOTAL_CHARS = 64 * 1024
 _SNAPSHOT_ARGS_TRUNCATED_SUFFIX = "...[truncated]"
 
+# ── Retention: run journals are debugging artifacts, not durable state ──────
+# They were only reclaimed when the owning session was deleted, so a long-lived
+# session accumulated every request/response payload it ever produced (observed:
+# 164 MB across 3 sessions, single runs up to 4.7 MB). Prune on write, bounded on
+# both axes so neither a marathon session nor a burst of runs can grow without
+# limit. Age is the primary knob; count and byte caps backstop a busy day.
+_RUN_JOURNAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_RUN_JOURNAL_MAX_RUNS_PER_SESSION = 200
+_RUN_JOURNAL_MAX_BYTES_PER_SESSION = 64 * 1024 * 1024
+_RUN_JOURNAL_PRUNE_MIN_INTERVAL_SECONDS = 300.0
+_RUN_JOURNAL_PRUNE_STATE: dict[str, float] = {}
+
+
+def _prune_run_journal(session_id: str, *, session_dir: Path | None = None) -> int:
+    """Drop stale run journals for one session; return the number of files removed.
+
+    Runs after a journal append, throttled per session so the common path stays a
+    single stat. Best-effort: any per-file error is skipped rather than raised,
+    because losing a debug artifact must never fail the run that produced it.
+    """
+    try:
+        root = _default_session_dir() if session_dir is None else Path(session_dir)
+        session_root = root / RUN_JOURNAL_DIR_NAME / str(session_id)
+        if not session_root.is_dir():
+            return 0
+        now = time.time()
+        if now - _RUN_JOURNAL_PRUNE_STATE.get(str(session_id), 0.0) < _RUN_JOURNAL_PRUNE_MIN_INTERVAL_SECONDS:
+            return 0
+
+        entries: list[tuple[float, int, Path]] = []
+        for path in session_root.glob("*.jsonl"):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, path))
+        if not entries:
+            return 0
+
+        cutoff = now - _RUN_JOURNAL_RETENTION_SECONDS
+        doomed = {p for mtime, _size, p in entries if mtime < cutoff}
+
+        # Count cap: keep the newest N when the session outlives the age window.
+        if len(entries) > _RUN_JOURNAL_MAX_RUNS_PER_SESSION:
+            for _mtime, _size, path in sorted(entries, key=lambda e: e[0], reverse=True)[
+                _RUN_JOURNAL_MAX_RUNS_PER_SESSION:
+            ]:
+                doomed.add(path)
+
+        # Byte cap: drop oldest-first until the session fits, never touching the
+        # newest run (the one being written right now).
+        survivors = [e for e in entries if e[2] not in doomed]
+        total = sum(size for _mtime, size, _path in survivors)
+        for _mtime, size, path in sorted(survivors, key=lambda e: e[0]):
+            if total <= _RUN_JOURNAL_MAX_BYTES_PER_SESSION:
+                break
+            if path == max(entries, key=lambda e: e[0])[2]:
+                break
+            doomed.add(path)
+            total -= size
+
+        removed = 0
+        for path in doomed:
+            try:
+                path.unlink()
+                _discard_cached_summary(path)
+                removed += 1
+            except OSError:
+                continue
+        _RUN_JOURNAL_PRUNE_STATE[str(session_id)] = now
+        return removed
+    except Exception:
+        # Best-effort: retention must never break the run that triggered it. This
+        # module is a pure-stdlib leaf (no logging import), and a failed prune is
+        # not worth surfacing to the user.
+        _RUN_JOURNAL_PRUNE_STATE[str(session_id)] = time.time()
+        return 0
+
 
 def _default_session_dir() -> Path:
     from api.models import SESSION_DIR
@@ -442,6 +520,10 @@ def append_run_event(
         _discard_cached_summary(path)
         if created_file:
             _fsync_parent_dir(path)
+            # A brand-new journal file is the cheap signal that this session just
+            # started another run — the right moment to shed stale ones. Bounded
+            # to once per run, never per event, and throttled inside the pruner.
+            _prune_run_journal(session_id, session_dir=session_dir)
         return event
 
 

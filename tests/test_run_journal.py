@@ -1,8 +1,12 @@
 import json
+import os
+import time
 from pathlib import Path
 
+import api.run_journal as run_journal
 from api.run_journal import (
     REPLAY_SKIPPED_SSE_EVENTS,
+    RUN_JOURNAL_DIR_NAME,
     RunJournalWriter,
     append_run_event,
     find_run_summary,
@@ -326,3 +330,111 @@ def test_stale_interrupted_event_skips_terminal_journal(tmp_path, monkeypatch):
     monkeypatch.setattr("api.run_journal._default_session_dir", lambda: tmp_path)
 
     assert stale_interrupted_event("session_1", "run_1") is None
+
+
+# ── Run-journal retention ────────────────────────────────────────────────────
+# Journals are debugging artifacts and used to be reclaimed only when the owning
+# session was deleted, so a long-lived session grew without bound. These cover the
+# three independent caps (age / count / bytes) and the two invariants that matter:
+# the newest run is never removed, and pruning is throttled per session.
+
+
+def _make_journal(session_root, name, *, age_seconds, size=10):
+    path = session_root / name
+    path.write_bytes(b"x" * size)
+    mtime = time.time() - age_seconds
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def _journal_root(tmp_path, session_id):
+    root = tmp_path / "sessions" / RUN_JOURNAL_DIR_NAME / session_id
+    root.mkdir(parents=True)
+    return root
+
+
+def test_retention_removes_aged_runs_and_keeps_fresh_ones(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    run_journal._RUN_JOURNAL_PRUNE_STATE.clear()
+    root = _journal_root(tmp_path, "s1")
+
+    old_a = _make_journal(root, "old_a.jsonl", age_seconds=30 * 86400)
+    old_b = _make_journal(root, "old_b.jsonl", age_seconds=30 * 86400)
+    fresh = _make_journal(root, "fresh.jsonl", age_seconds=0)
+
+    removed = run_journal._prune_run_journal("s1", session_dir=tmp_path / "sessions")
+
+    assert removed == 2
+    assert not old_a.exists() and not old_b.exists()
+    assert fresh.exists()
+
+
+def test_retention_never_removes_the_newest_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    run_journal._RUN_JOURNAL_PRUNE_STATE.clear()
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_MAX_BYTES_PER_SESSION", 100)
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_MAX_RUNS_PER_SESSION", 999)
+    root = _journal_root(tmp_path, "s2")
+
+    # Every file is over the byte cap on its own; the newest must still survive.
+    for i in range(4):
+        _make_journal(root, f"r{i}.jsonl", age_seconds=(4 - i) * 60, size=500)
+    newest = root / "r3.jsonl"
+
+    run_journal._prune_run_journal("s2", session_dir=tmp_path / "sessions")
+
+    assert newest.exists(), "the run currently being written must never be pruned"
+    assert sum(p.stat().st_size for p in root.glob("*.jsonl")) <= 100 * 2
+
+
+def test_retention_enforces_a_run_count_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    run_journal._RUN_JOURNAL_PRUNE_STATE.clear()
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_MAX_RUNS_PER_SESSION", 3)
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_MAX_BYTES_PER_SESSION", 10**9)
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_RETENTION_SECONDS", 10**9)
+    root = _journal_root(tmp_path, "s3")
+
+    for i in range(6):
+        _make_journal(root, f"c{i}.jsonl", age_seconds=(6 - i) * 60)
+
+    run_journal._prune_run_journal("s3", session_dir=tmp_path / "sessions")
+
+    assert sorted(p.name for p in root.glob("*.jsonl")) == ["c3.jsonl", "c4.jsonl", "c5.jsonl"]
+
+
+def test_retention_is_throttled_per_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    run_journal._RUN_JOURNAL_PRUNE_STATE.clear()
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_MAX_RUNS_PER_SESSION", 1)
+    root = _journal_root(tmp_path, "s4")
+    for i in range(4):
+        _make_journal(root, f"t{i}.jsonl", age_seconds=(4 - i) * 60)
+
+    sessions = tmp_path / "sessions"
+    assert run_journal._prune_run_journal("s4", session_dir=sessions) > 0
+    # Immediately after, the throttle must short-circuit rather than rescan.
+    assert run_journal._prune_run_journal("s4", session_dir=sessions) == 0
+
+
+def test_retention_is_best_effort_and_never_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    run_journal._RUN_JOURNAL_PRUNE_STATE.clear()
+    monkeypatch.setattr(
+        run_journal.Path, "glob", lambda self, pattern: (_ for _ in ()).throw(OSError("boom")),
+    )
+
+    assert run_journal._prune_run_journal("s5", session_dir=tmp_path / "sessions") == 0
+
+
+def test_appending_a_new_run_triggers_retention(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    run_journal._RUN_JOURNAL_PRUNE_STATE.clear()
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_RETENTION_SECONDS", 3600)
+    root = _journal_root(tmp_path, "s6")
+    _make_journal(root, "stale.jsonl", age_seconds=30 * 86400)
+
+    append_run_event("s6", "run_new", "token", {"text": "hi"}, session_dir=tmp_path / "sessions")
+
+    assert not (root / "stale.jsonl").exists(), "append should shed aged journals"
+    assert (root / "run_new.jsonl").exists()
