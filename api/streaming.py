@@ -11061,6 +11061,30 @@ def _run_agent_streaming(
     # surface the real, actionable cause (model_not_found / auth_mismatch).
     _captured_terminal_error = [None]
 
+    # Diagnostics the Agent classified as warning-worthy on the lifecycle rail,
+    # forwarded to the browser as 'warning' events. Keyed by message text so a
+    # provider that stalls across many poll cycles shows one notice, not fifty;
+    # cleared per turn (this dict lives inside the per-turn streaming scope).
+    _forwarded_diagnostic_notices: dict[str, float] = {}
+    _DIAGNOSTIC_NOTICE_MIN_INTERVAL_SECONDS = 30.0
+
+    def _diagnostic_notice_forwardable(kind: str, message: str) -> bool:
+        """Whether an unowned lifecycle message may be surfaced to the user.
+
+        Delegates to the Agent's own classifier rather than re-deriving policy
+        here: `is_warning_status` is true only for the explicit "warn" kind or a
+        `DiagnosticText` instance, which is how the Agent marks a message as
+        user-facing. Everything else stays on its original (dropped) path, so
+        this cannot promote routine lifecycle chatter into the transcript.
+        """
+        try:
+            from gateway.warning_notifications import is_warning_status
+            return bool(is_warning_status(kind, message))
+        except Exception:
+            # Import failure or an older Agent build without the helper: stay
+            # silent rather than guessing, matching the previous behaviour.
+            return False
+
     def _agent_status_callback(kind, message):
         """Bridge Agent lifecycle status into WebUI SSE.
 
@@ -11102,6 +11126,27 @@ def _run_agent_streaming(
         if _is_fallback_notice:
             _last_runtime_model_identity = None
             put('warning', {'type': 'fallback', 'message': _message})
+            return
+        # Anything that reached here is a lifecycle diagnostic the Agent considers
+        # worth showing (wait notices, stale-stream recoveries, retry context) that
+        # no branch above owned. The old code fell off the end and dropped it, so a
+        # provider that accepted the connection and then went silent produced no
+        # user-visible signal at all — the turn just sat on a spinner until the
+        # stream deadline expired. Forward it as a warning instead.
+        #
+        # Conservative on purpose: the Agent's own classifier decides what is
+        # warning-worthy (`is_warning_status`), so only forward messages it flagged
+        # as such. That keeps this a pass-through, not a second policy layer, and
+        # means routine chatter cannot leak into the transcript. Rate-limited per
+        # turn — a stalled provider can emit the same wait notice on every poll.
+        if not _diagnostic_notice_forwardable(_kind, _message):
+            return
+        _shown = _forwarded_diagnostic_notices.get(_message)
+        _now = time.monotonic()
+        if _shown is not None and (_now - _shown) < _DIAGNOSTIC_NOTICE_MIN_INTERVAL_SECONDS:
+            return
+        _forwarded_diagnostic_notices[_message] = _now
+        put('warning', {'type': 'provider_wait', 'message': _message})
 
     # xsession wakeup misroute root fix (Option 1): pre-init so the outer
     # finally can always reset even if an exception fires before the bind.
@@ -11784,6 +11829,30 @@ def _run_agent_streaming(
                     payload['reasoning_echo'] = True
                 put('interim_assistant', payload)
 
+            def on_thinking(text):
+                """Surface the Agent's wait notices (``thinking_callback``).
+
+                `_emit_wait_notice` routes "no output from provider for Ns —
+                reconnecting..." here, and the WebUI never registered this
+                callback, so a silently-stalling provider produced no signal on
+                any channel the browser could see: the turn simply sat on the
+                spinner until the stream deadline expired. These notices are the
+                Agent's own user-facing text for exactly that situation, so they
+                belong in the transcript as warnings.
+
+                Deliberately not routed into the token stream — a wait notice is
+                not model output and must never be persisted as one.
+                """
+                visible = str(text or '').strip()
+                if not visible:
+                    return
+                _now = time.monotonic()
+                _last = _forwarded_diagnostic_notices.get(visible)
+                if _last is not None and (_now - _last) < _DIAGNOSTIC_NOTICE_MIN_INTERVAL_SECONDS:
+                    return
+                _forwarded_diagnostic_notices[visible] = _now
+                put('warning', {'type': 'provider_wait', 'message': visible})
+
             # Pre-initialise the activity counter here so on_tool (which
             # closes over it) never captures an unbound name even if this
             # block is reordered later (Issue #765).
@@ -12441,6 +12510,12 @@ def _run_agent_streaming(
                 _agent_kwargs['tool_complete_callback'] = on_tool_complete
             if 'status_callback' in _agent_params:
                 _agent_kwargs['status_callback'] = _agent_status_callback
+            # Wait notices ("no output from provider for Ns") reach the browser
+            # through this channel; without it a stalled provider is invisible.
+            # Guarded like the other newer-Agent params so an older build that
+            # does not accept the kwarg cannot break agent construction.
+            if 'thinking_callback' in _agent_params:
+                _agent_kwargs['thinking_callback'] = on_thinking
             if 'max_iterations' in _agent_params and _max_iterations_cfg is not None:
                 _agent_kwargs['max_iterations'] = _max_iterations_cfg
             if 'max_tokens' in _agent_params and _max_tokens_cfg is not None:
