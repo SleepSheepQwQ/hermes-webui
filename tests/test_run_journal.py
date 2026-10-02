@@ -438,3 +438,44 @@ def test_appending_a_new_run_triggers_retention(tmp_path, monkeypatch):
 
     assert not (root / "stale.jsonl").exists(), "append should shed aged journals"
     assert (root / "run_new.jsonl").exists()
+
+
+def test_retention_keeps_the_newest_run_even_when_it_is_itself_expired(tmp_path, monkeypatch):
+    """The newest journal is the live run's — never a candidate, whatever its mtime.
+
+    Guards against a clock jump (or an out-of-band call to the pruner) deleting the
+    journal of the run that is still being written.
+    """
+    monkeypatch.setattr(run_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    run_journal._RUN_JOURNAL_PRUNE_STATE.clear()
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_RETENTION_SECONDS", 7 * 86400)
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_MAX_RUNS_PER_SESSION", 999)
+    root = _journal_root(tmp_path, "s7")
+
+    # Every file is past the age window; f1 is the newest of the three.
+    _make_journal(root, "f0.jsonl", age_seconds=40 * 86400)
+    _make_journal(root, "f1.jsonl", age_seconds=30 * 86400)
+    _make_journal(root, "f2.jsonl", age_seconds=35 * 86400)
+    newest = root / "f1.jsonl"
+
+    run_journal._prune_run_journal("s7", session_dir=tmp_path / "sessions")
+
+    assert newest.exists(), "an expired newest run must still survive"
+    assert not (root / "f0.jsonl").exists()
+    assert not (root / "f2.jsonl").exists()
+
+
+def test_retention_keeps_the_newest_run_under_a_count_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    run_journal._RUN_JOURNAL_PRUNE_STATE.clear()
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_MAX_RUNS_PER_SESSION", 1)
+    monkeypatch.setattr(run_journal, "_RUN_JOURNAL_RETENTION_SECONDS", 10**9)
+    root = _journal_root(tmp_path, "s8")
+
+    for i in range(4):
+        _make_journal(root, f"f{i}.jsonl", age_seconds=(4 - i) * 60)
+    newest = root / "f3.jsonl"
+
+    run_journal._prune_run_journal("s8", session_dir=tmp_path / "sessions")
+
+    assert newest.exists(), "the newest run must survive even a cap of 1"

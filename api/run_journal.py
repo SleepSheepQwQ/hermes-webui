@@ -106,7 +106,11 @@ def _prune_run_journal(session_id: str, *, session_dir: Path | None = None) -> i
             return 0
 
         cutoff = now - _RUN_JOURNAL_RETENTION_SECONDS
-        doomed = {p for mtime, _size, p in entries if mtime < cutoff}
+        # The newest run is the one currently being written (or just finished);
+        # it is never a prune candidate regardless of its mtime, so a clock jump
+        # or a manual/out-of-band call can never delete the live run's journal.
+        newest = max(entries, key=lambda e: e[0])[2]
+        doomed = {p for mtime, _size, p in entries if mtime < cutoff and p != newest}
 
         # Count cap: keep the newest N when the session outlives the age window.
         if len(entries) > _RUN_JOURNAL_MAX_RUNS_PER_SESSION:
@@ -122,7 +126,7 @@ def _prune_run_journal(session_id: str, *, session_dir: Path | None = None) -> i
         for _mtime, size, path in sorted(survivors, key=lambda e: e[0]):
             if total <= _RUN_JOURNAL_MAX_BYTES_PER_SESSION:
                 break
-            if path == max(entries, key=lambda e: e[0])[2]:
+            if path == newest:
                 break
             doomed.add(path)
             total -= size
