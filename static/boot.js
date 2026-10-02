@@ -2367,6 +2367,39 @@ $('modelSelect').onchange=async()=>{
     if(warn&&typeof showToast==='function') showToast(warn,4000);
   }
 };
+// ── Composer input: keep light sync work on every keystroke, defer the heavy ──
+// The user symptom is "typing in the composer stutters / jerks" (especially with
+// a Chinese IME, where one committed word emits MANY `input` events). The old
+// handler kicked off an un-debounced path-autocomplete lookup on EVERY keystroke,
+// and each lookup is a network request (/api/workspaces/suggest). During IME
+// composition every pinyin letter fired one, so the main thread was flooded with
+// fetch + dropdown rebuild work while the user typed. We now:
+//   • keep `updateSendBtn()` (cheap class/title sync) synchronous, so the Send/Stop
+//     button state never lags a keystroke;
+//   • keep the slash-command branch exactly as-is (matches are computed locally,
+//     no network) EXCEPT it is now skipped during IME composition;
+//   • debounce the path lookup (trailing 220ms) and skip it entirely while
+//     `_imeComposing` is true — results only matter once the user pauses typing;
+//   • tag each lookup with a monotonically increasing request id so a slow earlier
+//     response can never overwrite the dropdown produced by a newer keystroke.
+// `scheduleComposerAutoResize()` stays synchronous — it is already coalesced to one
+// rAF by the callee (static/messages.js scheduleComposerAutoResize) and moving it
+// behind a timer would visibly delay the composer growing a row.
+let _pathAcSeq=0;
+let _pathAcTimer=0;
+const _PATH_AC_DEBOUNCE_MS=220;
+/** Run the debounced path-autocomplete lookup for the current composer text. */
+function _runComposerPathAutocomplete(text,cursor,seq){
+  if(seq!==_pathAcSeq) return;                 // superseded by a newer keystroke
+  if(_imeComposing) return;                    // composing: matches would be stale mid-word
+  if(typeof getComposerPathAutocompleteMatches!=='function'){ hideCmdDropdown(); return; }
+  getComposerPathAutocompleteMatches(text,cursor).then(matches=>{
+    if(seq!==_pathAcSeq) return;               // out-of-order: a newer request already ran
+    const ta=$('msg');
+    if(!ta||ta.value!==text||ta.selectionStart!==cursor) return;
+    if(matches.length)showCmdDropdown(matches); else hideCmdDropdown();
+  }).catch(()=>{ if(seq===_pathAcSeq) hideCmdDropdown(); });
+}
 $('msg').addEventListener('input',()=>{
   updateSendBtn();
   scheduleComposerAutoResize();
@@ -2378,6 +2411,11 @@ $('msg').addEventListener('input',()=>{
   const text=$('msg').value;
   const _slashIdx=typeof _activeSlashCommandOffset==='function'?_activeSlashCommandOffset(text):-1;
   if(_slashIdx>=0&&text.indexOf('\n')===-1){
+    // Slash-command matches are computed locally (no network) and drive the
+    // dropdown the user is actively reading, so they stay on the input path —
+    // but skip while composing so a half-typed IME word never flashes a wrong
+    // command list. The trailing compositionend/edit will refresh it.
+    if(_imeComposing) return;
     if(typeof getSlashAutocompleteMatches==='function'){
       getSlashAutocompleteMatches(text).then(matches=>{
         if(($('msg').value||'')!==text) return;
@@ -2389,15 +2427,15 @@ $('msg').addEventListener('input',()=>{
       if(matches.length)showCmdDropdown(matches); else hideCmdDropdown();
     }
     if(typeof ensureSkillCommandsLoadedForAutocomplete==='function') ensureSkillCommandsLoadedForAutocomplete();
-  } else if(typeof getComposerPathAutocompleteMatches==='function'){
-    const cursor=$('msg').selectionStart;
-    getComposerPathAutocompleteMatches(text,cursor).then(matches=>{
-      const ta=$('msg');
-      if(!ta||ta.value!==text||ta.selectionStart!==cursor) return;
-      if(matches.length)showCmdDropdown(matches); else hideCmdDropdown();
-    }).catch(()=>hideCmdDropdown());
   } else {
-    hideCmdDropdown();
+    // Path autocomplete: debounce + IME guard + out-of-order protection (see above).
+    if(_pathAcTimer) clearTimeout(_pathAcTimer);
+    const seq=++_pathAcSeq;
+    const cursor=$('msg').selectionStart;
+    _pathAcTimer=setTimeout(()=>{
+      _pathAcTimer=0;
+      _runComposerPathAutocomplete(text,cursor,seq);
+    },_PATH_AC_DEBOUNCE_MS);
   }
 });
 // #5514/#5515: re-pin the transcript on ANY composer height change, not only the
@@ -2694,18 +2732,31 @@ function applyEmptyStatePanelPref(){
   $('emptyState').classList.toggle('no-welcome',window._hideEmptyStatePanel===true);
 }
 
+// Debounce the window `resize` work. On Android the soft keyboard opening/closing
+// fires a BURST of resize events (focus + layout settle), and each one ran
+// _syncWorkspacePanelInlineWidth() + syncWorkspacePanelState() + _applySidebarState()
+// synchronously — each of which reads layout and mutates classes, forcing repeated
+// synchronous reflows while the user is trying to type. Coalescing the burst into a
+// single trailing run (120ms) keeps the panel/sidebar geometry correct without the
+// jank. The visualViewport path below keeps its own separate 60ms debounce and is
+// intentionally left as-is (it tracks the keyboard inset, which needs to settle fast).
+let _windowResizeTimer=0;
 window.addEventListener('resize',()=>{
-  _syncWorkspacePanelInlineWidth();
-  syncWorkspacePanelState();
-  // Re-apply the sidebar state on viewport change (e.g. foldable unfold:
-  // phone 640px -> inner 804px, or desktop -> inner). The shared apply helper
-  // clears mobile drawer ownership when entering desktop width (so the mobile
-  // classes cannot block the desktop collapse selector), applies the tri-state
-  // default, and syncs ARIA — all without persisting anything to localStorage.
-  try{
-    if(typeof _applySidebarState==='function') _applySidebarState();
-  }catch(_){}
-  if(!window.visualViewport) _forceMobileViewportReflow();
+  if(_windowResizeTimer) clearTimeout(_windowResizeTimer);
+  _windowResizeTimer=setTimeout(()=>{
+    _windowResizeTimer=0;
+    _syncWorkspacePanelInlineWidth();
+    syncWorkspacePanelState();
+    // Re-apply the sidebar state on viewport change (e.g. foldable unfold:
+    // phone 640px -> inner 804px, or desktop -> inner). The shared apply helper
+    // clears mobile drawer ownership when entering desktop width (so the mobile
+    // classes cannot block the desktop collapse selector), applies the tri-state
+    // default, and syncs ARIA — all without persisting anything to localStorage.
+    try{
+      if(typeof _applySidebarState==='function') _applySidebarState();
+    }catch(_){}
+    if(!window.visualViewport) _forceMobileViewportReflow();
+  },120);
 });
 
 // On PWAs / mobile browsers that expose visualViewport, keyboard show/hide and
