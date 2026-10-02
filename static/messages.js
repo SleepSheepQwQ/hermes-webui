@@ -8172,6 +8172,13 @@ function _startApprovalFallbackPoll(sid) {
     if (_approvalPollingSessionMissingOrMismatched(sid)) {
       stopApprovalPolling(); _hideApprovalCardIfOwner(sid, true); return;
     }
+    // A hidden tab has no card to update, and this poller's interval keeps
+    // running while backgrounded, so without this it would fire every 1.5s
+    // forever in the background — competing with the composer's draft saves for
+    // connections and for the session lock. Short-circuiting the tick (rather
+    // than stopping the timer) means the next tick after the tab is shown polls
+    // again with no extra re-arm needed.
+    if (typeof document !== 'undefined' && document.hidden) return;
     if (_approvalFallbackPollInFlight) return;
     _approvalFallbackPollInFlight = true;
     const focusEpoch = _promptPollerFocusEpoch;
@@ -9360,6 +9367,10 @@ function _startClarifyFallbackPoll(sid) {
     if (!S.session || S.session.session_id !== sid) {
       stopClarifyPolling(); _hideClarifyCardIfOwner(sid, true, 'session'); return;
     }
+    // Same reasoning as the approval poller: a hidden tab cannot show a clarify
+    // card, and the interval keeps running while backgrounded, so skip the work
+    // rather than the timer. The next tick after the tab is shown polls again.
+    if (typeof document !== 'undefined' && document.hidden) return;
     if (_clarifyFallbackPollInFlight) return;
     _clarifyFallbackPollInFlight = true;
     const focusEpoch = _promptPollerFocusEpoch;
